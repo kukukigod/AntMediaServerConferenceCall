@@ -258,9 +258,11 @@ class WebRTCManager {
 
         void cleanup() {
             if(!publishStreamId.empty() && isPublisher[publishStreamId]){
-                g_signaling->sendStopPublish();
-                g_signaling->sendStopPlayRoom();
-                g_signaling->sendLeaveRoom();
+                try {
+                    g_signaling->sendStopPublish();
+                    g_signaling->sendStopPlayRoom();
+                    g_signaling->sendLeaveRoom();
+                } catch(...) {}
             }
             if (gstManager) gstManager->stopAudioPlayer();
             gstManager.reset();
@@ -268,8 +270,13 @@ class WebRTCManager {
             logWithTime("[cleanup] closing all PeerConnections");
 
             lock_guard<recursive_mutex> lock(m_mutex);
-            for (auto &[id, pc] : pcs)
+            for (auto &[id, pc] : pcs) {
+                // Pre-clear callbacks to prevent deadlocks during destruction
+                pc->onTrack(nullptr);
+                pc->onLocalCandidate(nullptr);
+                pc->onLocalDescription(nullptr);
                 pc->close();
+            }
 
             pcs.clear();
             localDataChannels.clear();
@@ -545,6 +552,16 @@ std::thread startConsoleInputThread(std::atomic_bool& running, std::function<voi
 
 int main(int argc, char* argv[])
 {
+    // Environment Variable Support
+    const char* env_url = std::getenv("AMS_WS_URL");
+    string ams_url = (env_url != nullptr) ? string(env_url) : AMS_WS;
+
+    // Safety check for placeholder string
+    if (ams_url == "AMS_WEBSOCKET_URL") {
+        logWithTime("[ERROR] No WebSocket URL provided. Set AMS_WS_URL environment variable.");
+        return -1;
+    }
+
     bool isPlayer = (argc > 1 && string(argv[1]) == "--player");
     string prefix = isPlayer ? "player_" : "publisher_";
     signal(SIGINT, signalHandler);
@@ -562,8 +579,18 @@ int main(int argc, char* argv[])
     g_publishStreamId = "BC04_" + prefix + to_string(rand());
 #endif
 
+    logWithTime("[init] Version 1.0.4 - Starting");
+    logWithTime("[init] URL: " + ams_url);
+
     WebRTCManager manager(ROOM_ID_STR, isPlayer);
-    g_ws.open(AMS_WS);
+
+    try {
+        g_ws.open(ams_url);
+    } catch (const std::exception& e) {
+        logWithTime("[ERROR] WebSocket failed to open: " + string(e.what()));
+        return -1;
+    }
+
     g_signaling = make_shared<AMSSignalingClient>(&g_ws, g_publishStreamId, ROOM_ID_STR);
 
     manager.init();
@@ -577,7 +604,9 @@ int main(int argc, char* argv[])
 
     g_ws.onMessage([&](variant<vector<std::byte>, string> msg){
             if (holds_alternative<string>(msg)) {
-            try { g_signaling->handleMessage(json::parse(get<string>(msg))); } catch(...) {}
+                try { 
+                    if (g_signaling) g_signaling->handleMessage(json::parse(get<string>(msg))); 
+                } catch(...) {}
             }
             });
 
@@ -600,7 +629,10 @@ int main(int argc, char* argv[])
     g_ws.onOpen(nullptr);
     g_ws.onClosed(nullptr);
     if (g_signaling) { g_signaling->shutdown(); g_signaling.reset(); }
-    if (g_ws_open) g_ws.close();
+    if (g_ws_open) {
+        try { g_ws.close(); } catch(...) {}
+    }
 
+    logWithTime("[main] exited");
     return 0;
 }
