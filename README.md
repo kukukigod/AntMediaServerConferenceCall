@@ -36,6 +36,8 @@ g++ -std=c++17 main.cpp AMSSignalingClient.cpp GstManager.cpp Logger.cpp \
     -o AntMediaServerConferenceCall
 
 Execution
+0. Export AMS_WS_URL
+export AMS_WS_URL="ws://your-server-ip:5080/ConferenceCall/websocket"
 
 1. Publisher Mode (Default)
 Broadcasts local media (H.264/Opus) to the room.
