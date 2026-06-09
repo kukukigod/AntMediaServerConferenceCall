@@ -4,6 +4,7 @@
 #include "GstManager.h"
 #include "AMSSignalingClient.h"
 #include "Logger.h"
+#include "Log.h"
 
 #include <iostream>
 #include <iomanip>
@@ -26,15 +27,8 @@ using namespace rtc;
 using json = nlohmann::json;
 using namespace std;
 
-#define AMS_WS    "AMS_WEBSOCKET_URL" //Please modify it
-#define ROOM_ID_STR   "room1"  // Renamed to avoid confusion with roomId variable
+#define ROOM_ID_STR   "room1"
 
-#define WIDTH     720
-#define HEIGHT    480
-#define FPS       30
-#define BITRATE   1000000
-
-// 1. Move Enum outside for better scope access
 enum class AMSEvent {
     UNKNOWN,
     JOINED_THE_ROOM,
@@ -45,25 +39,161 @@ enum class AMSEvent {
     SUBTRACK_REMOVED
 };
 
-static atomic_bool g_running(true);
-static atomic_bool g_ws_open(false);
-
-static unique_ptr<GstManager> gstManager;
-static string g_publishStreamId;
-static shared_ptr<AMSSignalingClient> g_signaling;
-static WebSocket g_ws;
-
-static void signalHandler(int sig) {
-    logWithTime("[signal] exiting");
-    g_running = false;
-}
-
 class WebRTCManager {
     public:
-        WebRTCManager(const string &roomId, bool isPlayer)
-            : roomId(roomId), isOnlyPlayer(isPlayer) {}
+        WebRTCManager() 
+            : m_signalingServerUrl(""), 
+            m_roomId(ROOM_ID_STR), 
+            m_publishStreamId(""),
+            m_isOnlyPlayer(false), 
+            m_wsOpen(false), 
+            m_isCommunicating(false) 
+    {
+        // Initialize libdatachannel logger
+        rtc::InitLogger(rtc::LogLevel::Warning, [](rtc::LogLevel level, const std::string& msg) {
+                if (msg.find("juice: Send failed") != std::string::npos || msg.find("STUN binding failed") != std::string::npos) return;
+                std::cerr << msg << std::endl;
+                });
+    }
 
-        // 2. Helper to convert string definition to enum (Class member or static)
+        ~WebRTCManager() {
+            Stop2WayCommunication();
+        }
+
+        // API 1: Set Signaling Server URL
+        void SetSignalingServerURL(const string& url) {
+            lock_guard<recursive_mutex> lock(m_apiMutex);
+            m_signalingServerUrl = url;
+            DBG(0, "[API] Signaling Server URL set to: %s\n", m_signalingServerUrl.c_str());
+        }
+
+        // API 2: Start Two-Way Communication (Non-blocking)
+        bool Start2WayCommunication(bool isPlayer) {
+            lock_guard<recursive_mutex> lock(m_apiMutex);
+            if (m_isCommunicating) {
+                DBG(0, "[API] Communication is already running.\n");
+                return true;
+            }
+
+            if (m_signalingServerUrl.empty() || m_signalingServerUrl == "AMS_WEBSOCKET_URL") {
+                DBG(0, "[ERROR] Invalid Signaling Server URL. Please set valid URL first.\n");
+                return false;
+            }
+
+            m_isOnlyPlayer = isPlayer;
+            m_isCommunicating = true;
+            m_wsOpen = false;
+
+            string prefix = m_isOnlyPlayer ? "player_" : "publisher_";
+            srand((unsigned)time(nullptr));
+#if PLATFORM_NUM == 0x86
+            m_publishStreamId = "Ubuntu_" + prefix + to_string(rand());
+#else
+            m_publishStreamId = "BC04_" + prefix + to_string(rand());
+#endif
+
+            DBG(0, "[init] Version 1.0.4 - Starting API Instance\n");
+            DBG(0, "[init] URL: %s\n", m_signalingServerUrl.c_str());
+
+            // Setup GStreamer Manager
+            m_gstManager = make_unique<GstManager>(720, 480, 30, 1000000);
+            m_gstManager->startAudioPlayer();
+
+            // Setup Signaling client wrapper
+            m_signaling = make_shared<AMSSignalingClient>(&m_ws, m_publishStreamId, m_roomId);
+
+            // Setup signaling and WebRTC state machine
+            initWebRTCStateMachine();
+
+            // Setup WebSocket Callbacks before opening
+            m_ws.onOpen([this](){
+                    DBG(0, "[WS] connected\n");
+                    m_wsOpen = true;
+                    setupPublishPeer(m_publishStreamId);
+                    if (m_signaling) {
+                    m_signaling->sendJoinRoom();
+                    }
+                    });
+
+            m_ws.onMessage([this](variant<vector<std::byte>, string> msg){
+                    if (holds_alternative<string>(msg)) {
+                    try { 
+                    if (m_signaling) m_signaling->handleMessage(json::parse(get<string>(msg))); 
+                    } catch(...) {}
+                    }
+                    });
+
+            m_ws.onClosed([this](){
+                    DBG(0, "[WS] closed\n");
+                    m_wsOpen = false;
+                    });
+
+            try {
+                m_ws.open(m_signalingServerUrl);
+            } catch (const std::exception& e) {
+                DBG(0, "[ERROR] WebSocket failed to open: %s\n", e.what());
+                cleanupResources();
+                m_isCommunicating = false;
+                return false;
+            }
+
+            return true;
+        }
+
+        // API 3: Stop Two-Way Communication
+        void Stop2WayCommunication() {
+            lock_guard<recursive_mutex> lock(m_apiMutex);
+            if (!m_isCommunicating) return;
+
+            DBG(0, "[API] Stopping Two-Way Communication...\n");
+            cleanupResources();
+            m_isCommunicating = false;
+            DBG(0, "[API] Stopped successfully\n");
+        }
+
+        // Exposed Chat Tool API for main usage
+        void SendChatMessage(const string& text) {
+            lock_guard<recursive_mutex> lock(m_apiMutex);
+            if (!m_isCommunicating || !m_wsOpen) {
+                DBG(0, "[API] Cannot send chat message. Not connected.\n");
+                return;
+            }
+
+            std::time_t now = std::time(nullptr);
+            std::tm tm{};
+            localtime_r(&now, &tm);
+
+            char dateBuf[64];
+            std::strftime(dateBuf, sizeof(dateBuf), "%a %b %d %Y %H:%M:%S GMT%z", &tm);
+
+            json j = {
+                {"eventType", "MESSAGE_RECEIVED"},
+                {"message", text},
+                {"senderId", m_publishStreamId},
+                {"name", m_publishStreamId},
+                {"date", std::string(dateBuf)}
+            };
+
+            string payload = j.dump();
+
+            lock_guard<recursive_mutex> stateLock(m_stateMutex);
+            if (localDataChannels.count(m_publishStreamId)) {
+                auto dc = localDataChannels[m_publishStreamId];
+                if (dc && dc->isOpen()) {
+                    DBG(0, "[chat] [localDc] [%s] %s\n", dc->label().c_str(), payload.c_str());
+                    dc->send(payload);
+                }
+            }
+        }
+
+        void SendBinaryMessage(const std::vector<std::byte>& data, const std::string& label = ROOM_ID_STR) {
+            lock_guard<recursive_mutex> stateLock(m_stateMutex);
+            if (localDataChannels.count(label) && localDataChannels[label]->isOpen()) {
+                localDataChannels[label]->send(data);
+            }
+        }
+
+    private:
         AMSEvent stringToEvent(const std::string& def) {
             static const std::unordered_map<std::string, AMSEvent> eventMap = {
                 {"joinedTheRoom",   AMSEvent::JOINED_THE_ROOM},
@@ -77,50 +207,45 @@ class WebRTCManager {
             return (it != eventMap.end()) ? it->second : AMSEvent::UNKNOWN;
         }
 
-        void init() {
-            gstManager = make_unique<GstManager>(WIDTH, HEIGHT, FPS, BITRATE);
-            gstManager->startAudioPlayer();
-
+        void initWebRTCStateMachine() {
             // Both roles setup the "Self" PeerConnection for DataChannel/Signaling
-            setupPublishPeer(g_publishStreamId);
-            g_signaling->onStartOfferer = [this](const string& streamId){
-                logWithTime("[info] Got 'start', I am offerer for stream " + streamId);
+            setupPublishPeer(m_publishStreamId);
+
+            m_signaling->onStartOfferer = [this](const string& streamId){
+                DBG(0, "[info] Got 'start', I am offerer for stream %s\n", streamId.c_str());
                 startOffer(streamId);
             };
 
-            g_signaling->onRemoteSDP = [this](const string& streamId, const string& type, const string& sdp){
+            m_signaling->onRemoteSDP = [this](const string& streamId, const string& type, const string& sdp){
                 handleRemoteSDP(streamId, type, sdp);
             };
 
-            g_signaling->onRemoteCandidate = [this](const string& streamId, const string& cand, const string& mid, int label){
+            m_signaling->onRemoteCandidate = [this](const string& streamId, const string& cand, const string& mid, int label){
                 addRemoteCandidate(streamId, cand, mid);
             };
 
-            // 3. Updated onNotification handler (Clean State Machine)
-            g_signaling->onNotification = [this](const nlohmann::json& msg) {
+            m_signaling->onNotification = [this](const nlohmann::json& msg) {
                 std::string def = msg.value("definition", "");
                 AMSEvent event = stringToEvent(def);
 
-                // Pre-extract tokens to avoid redundant lookups and switch scope issues
                 std::string streamId = msg.contains("streamId") ? msg["streamId"].get<std::string>() : "";
                 std::string trackId  = msg.contains("trackId")  ? msg["trackId"].get<std::string>()  : "";
 
                 switch (event) {
                     case AMSEvent::JOINED_THE_ROOM:
-                        if (isOnlyPlayer) {
-                            logWithTime("[Role] Player: Publishing with NO media (DataChannel only)");
-                            g_signaling->sendPublish(false, false);
+                        if (m_isOnlyPlayer) {
+                            DBG(0, "[Role] Player: Publishing with NO media (DataChannel only)\n");
+                            m_signaling->sendPublish(false, false);
                         } else {
-                            logWithTime("[Role] Publisher: Publishing WITH media");
-                            g_signaling->sendPublish(true, true);
+                            DBG(0, "[Role] Publisher: Publishing WITH media\n");
+                            m_signaling->sendPublish(true, true);
                         }
                         break;
 
                     case AMSEvent::PUBLISH_STARTED:
-                        // Both roles will play the room to see others
-                        if (sendPlay.find(roomId) == sendPlay.end()) {
-                            sendPlay[roomId] = true;
-                            g_signaling->sendPlayRoom();
+                        if (sendPlay.find(m_roomId) == sendPlay.end()) {
+                            sendPlay[m_roomId] = true;
+                            m_signaling->sendPlayRoom();
                         }
                         break;
 
@@ -133,23 +258,20 @@ class WebRTCManager {
                     case AMSEvent::PLAY_FINISHED:
                         if (!streamId.empty()) {
                             removePeerIfNotExist(streamId);
-                            if (streamId == roomId) {
-                                // AMS will send play_finished when there is only one peer in the room.
-                                sendPlay[roomId] = true;
-                                g_signaling->sendPlayRoom();
-                                logWithTime("[room] Only one peer in the room, send play room again");
+                            if (streamId == m_roomId) {
+                                sendPlay[m_roomId] = true;
+                                m_signaling->sendPlayRoom();
+                                DBG(0, "[room] Only one peer in the room, send play room again\n");
                             }
                         }
                         break;
 
                     case AMSEvent::SUBTRACK_ADDED:
-                        if (!trackId.empty() && trackId != g_publishStreamId) {
-                            lock_guard<recursive_mutex> lock(m_mutex);
+                        if (!trackId.empty() && trackId != m_publishStreamId) {
+                            lock_guard<recursive_mutex> lock(m_stateMutex);
 
-                            // Check if PC exists and is NOT closed
                             if (pcs.count(trackId)) {
                                 if (pcs[trackId]->state() != rtc::PeerConnection::State::Closed) {
-                                    // Already has an active connection for this track, skip
                                     return;
                                 }
                             }
@@ -157,8 +279,8 @@ class WebRTCManager {
                             if (sendPlay.count(trackId) && sendPlay[trackId]) return;
 
                             sendPlay[trackId] = true;
-                            logWithTime("[room] New remote track detected: " + trackId + ", sending play");
-                            g_signaling->sendPlayStream(trackId);
+                            DBG(0, "[room] New remote track detected: %s, sending play\n", trackId.c_str());
+                            m_signaling->sendPlayStream(trackId);
                         }
                         break;
 
@@ -166,49 +288,48 @@ class WebRTCManager {
                         if (!trackId.empty()) {
                             if (sendPlay.count(trackId)) {
                                 sendPlay.erase(trackId);
-                                logWithTime("[room] Remote track leaved, trackId " + trackId);
+                                DBG(0, "[room] Remote track leaved, trackId %s\n", trackId.c_str());
                             } else {
-                                logWithTime("[room] Remote track leaved, ignore trackId " + trackId);
+                                DBG(0, "[room] Remote track leaved, ignore trackId %s\n", trackId.c_str());
                             }
                         }
                         break;
 
                     default:
                         if (!def.empty()) {
-                            logWithTime("[warning] Unknown AMS event definition: " + def);
+                            DBG(0, "[warning] Unknown AMS event definition: %s\n", def.c_str());
                         }
                         break;
                 }
             };
         }
 
-        // ---------------- Publish ----------------
         void setupPublishPeer(const string& streamId){
-            lock_guard<recursive_mutex> lock(m_mutex);
+            lock_guard<recursive_mutex> lock(m_stateMutex);
             if(pcs.count(streamId)) return;
 
             auto pc = createPeerIfNotExist(streamId, true);
 
-            publishStreamId = streamId;
+            m_publishStreamId = streamId;
             isPublisher[streamId] = true;
 
-            if (!isOnlyPlayer)
+            if (!m_isOnlyPlayer)
                 setupLocalTracks(pc, streamId);
 
             if(!localDataChannels.count(streamId)){
                 auto dc = pc->createDataChannel(streamId);
                 localDataChannels[streamId] = dc;
 
-                dc->onOpen([this, streamId](){
-                        logWithTime("[DataChannel][Local][" + streamId + "] opened");
+                dc->onOpen([streamId](){
+                        DBG(0, "[DataChannel][Local][%s] opened\n", streamId.c_str());
                         });
 
-                dc->onClosed([this, streamId](){
-                        logWithTime("[DataChannel][Local][" + streamId + "] closed");
+                dc->onClosed([streamId](){
+                        DBG(0, "[DataChannel][Local][%s] closed\n", streamId.c_str());
                         });
 
-                dc->onError([this, streamId](const string& e){
-                        logWithTime("[DataChannel][Local][" + streamId + "] error: " + e);
+                dc->onError([streamId](const string& e){
+                        DBG(0, "[DataChannel][Local][%s] error: %s\n", streamId.c_str(), e.c_str());
                         });
 
                 dc->onMessage([this, streamId](variant<vector<std::byte>, string> msg){
@@ -219,92 +340,10 @@ class WebRTCManager {
             }
         }
 
-        // ---------------- Send Chat Message ----------------
-        void sendChatMessage(const string& text){
-            std::time_t now = std::time(nullptr);
-            std::tm tm{};
-            localtime_r(&now, &tm);
-
-            char dateBuf[64];
-            std::strftime(dateBuf, sizeof(dateBuf), "%a %b %d %Y %H:%M:%S GMT%z", &tm);
-
-            json j = {
-                {"eventType", "MESSAGE_RECEIVED"},
-                {"message", text},
-                {"senderId", publishStreamId},
-                {"name", publishStreamId},
-                {"date", std::string(dateBuf)}
-            };
-
-            string payload = j.dump();
-
-            lock_guard<recursive_mutex> lock(m_mutex);
-            if(localDataChannels.count(publishStreamId)){
-                auto dc = localDataChannels[publishStreamId];
-                if(dc && dc->isOpen()){
-                    logWithTime("[chat] [localDc] [" + dc->label() + "] " + payload);
-                    dc->send(payload);
-                }
-            }
-        }
-
-        void sendBinaryMessage(const std::vector<std::byte>& data, const std::string& label=ROOM_ID_STR)
-        {
-            lock_guard<recursive_mutex> lock(m_mutex);
-            if(localDataChannels.count(label) && localDataChannels[label]->isOpen()){
-                localDataChannels[label]->send(data);
-            }
-        }
-
-        void cleanup() {
-            if(!publishStreamId.empty() && isPublisher[publishStreamId]){
-                try {
-                    g_signaling->sendStopPublish();
-                    g_signaling->sendStopPlayRoom();
-                    g_signaling->sendLeaveRoom();
-                } catch(...) {}
-            }
-            if (gstManager) gstManager->stopAudioPlayer();
-            gstManager.reset();
-
-            logWithTime("[cleanup] closing all PeerConnections");
-
-            lock_guard<recursive_mutex> lock(m_mutex);
-            for (auto &[id, pc] : pcs) {
-                // Pre-clear callbacks to prevent deadlocks during destruction
-                pc->onTrack(nullptr);
-                pc->onLocalCandidate(nullptr);
-                pc->onLocalDescription(nullptr);
-                pc->close();
-            }
-
-            pcs.clear();
-            localDataChannels.clear();
-            remoteDataChannels.clear();
-            remoteTracks.clear();
-            played.clear();
-            sendPlay.clear();
-        }
-
-    private:
-        string roomId;
-        string publishStreamId;
-        bool isOnlyPlayer;
-        recursive_mutex m_mutex;
-        unordered_map<string, shared_ptr<PeerConnection>> pcs;
-        unordered_map<string, bool> isPublisher;
-        unordered_map<string, bool> sendPlay, played;
-        unordered_map<string, vector<shared_ptr<Track>>> remoteTracks;
-        unordered_map<string, vector<Candidate>> pendingCandidates;
-        unordered_map<string, string> midTypeMap;
-        unordered_map<string, shared_ptr<DataChannel>> localDataChannels;
-        unordered_map<string, shared_ptr<DataChannel>> remoteDataChannels;
-        unordered_map<string, bool> isStreamTalking;
-
         shared_ptr<PeerConnection> createPeerIfNotExist(const string& streamId, bool needDC){
             if(pcs.count(streamId)) return pcs[streamId];
 
-            logWithTime("[pc] create PeerConnection for stream " + streamId);
+            DBG(0, "[pc] create PeerConnection for stream %s\n", streamId.c_str());
 
             Configuration config;
             config.disableAutoNegotiation = true;
@@ -317,24 +356,26 @@ class WebRTCManager {
             if(needDC) setupDataChannel(pc, streamId);
 
             pc->onTrack([this, streamId](shared_ptr<Track> track){ addRemoteTrack(track, streamId); });
-            pc->onLocalCandidate([streamId](Candidate c){ g_signaling->sendTakeCandidate(streamId, c); });
-            pc->onLocalDescription([streamId](Description desc){
-                    g_signaling->sendTakeConfiguration(
+            pc->onLocalCandidate([this, streamId](Candidate c){ if (m_signaling) m_signaling->sendTakeCandidate(streamId, c); });
+            pc->onLocalDescription([this, streamId](Description desc){
+                    if (m_signaling) {
+                    m_signaling->sendTakeConfiguration(
                             streamId,
                             desc.type() == Description::Type::Offer ? "offer" : "answer",
                             string(desc)
                             );
+                    }
                     });
 
             pc->onIceStateChange([streamId](PeerConnection::IceState state) {
-                    logWithTime("[ICE][" + streamId + "] State: " + to_string(static_cast<int>(state)));
+                    DBG(0, "[ICE][%s] State: %d\n", streamId.c_str(), static_cast<int>(state));
                     });
 
             return pc;
         }
 
         void removePeerIfNotExist(const string& streamId){
-            lock_guard<recursive_mutex> lock(m_mutex);
+            lock_guard<recursive_mutex> lock(m_stateMutex);
             if(localDataChannels.count(streamId)){
                 if(localDataChannels[streamId]->isOpen()) localDataChannels[streamId]->close();
                 localDataChannels.erase(streamId);
@@ -352,26 +393,28 @@ class WebRTCManager {
         }
 
         void addRemoteTrack(shared_ptr<Track> track, const string &streamId) {
-            lock_guard<recursive_mutex> lock(m_mutex);
+            lock_guard<recursive_mutex> lock(m_stateMutex);
             remoteTracks[streamId].push_back(track);
             track->setMediaHandler(make_shared<RtcpReceivingSession>());
 
             string kind = midTypeMap.count(track->mid()) ? midTypeMap[track->mid()] : track->description().type();
 
-            logWithTime("[SFU] Remote track added for stream " + streamId + " mid=" + track->mid() + " type=" + kind);
+            DBG(0, "[SFU] Remote track added for stream %s mid=%s type=%s\n", streamId.c_str(), track->mid().c_str(), kind.c_str());
 
             track->onMessage([this, kind, streamId](std::variant<std::vector<std::byte>, std::string> msg){
                     if (kind == "audio" && holds_alternative<std::vector<std::byte>>(msg)){
                     auto &data = get<std::vector<std::byte>>(msg);
 
                     bool playStream = false;
-                    lock_guard<recursive_mutex> lock(m_mutex);
+                    lock_guard<recursive_mutex> lock(m_stateMutex);
                     if(isStreamTalking.count(streamId))
                     playStream = isStreamTalking[streamId];
 #if PLATFORM_NUM == 0x86
-                    if(gstManager) gstManager->pushAudioFrame(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+                    if(m_gstManager) m_gstManager->pushAudioFrame(reinterpret_cast<const uint8_t*>(data.data()), data.size());
 #else
-                    if(playStream == true) gstManager->pushAudioFrame(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+                    if(playStream == true) {
+                    if(m_gstManager) m_gstManager->pushAudioFrame(reinterpret_cast<const uint8_t*>(data.data()), data.size());
+                    }
 #endif
                     }
                     });
@@ -412,7 +455,6 @@ class WebRTCManager {
             }
         }
 
-        // ---------------- Local Tracks Setup ----------------
         void setupLocalTracks(shared_ptr<PeerConnection> pc, const string &streamId){
             // Video Track Setup
             Description::Video videoDesc("video-stream", Description::Direction::SendOnly);
@@ -421,12 +463,13 @@ class WebRTCManager {
             auto localVideoTrack = pc->addTrack(videoDesc);
 
             localVideoTrack->onOpen([this, localVideoTrack](){
-                    // Updated to use specific RTP frame callback for WebRTC
-                    gstManager->setOnVideoRTPFrame([localVideoTrack](const vector<uint8_t>& rtpPayload){
+                    if(m_gstManager) {
+                    m_gstManager->setOnVideoRTPFrame([localVideoTrack](const vector<uint8_t>& rtpPayload){
                             if(localVideoTrack->isOpen())
                             localVideoTrack->send(reinterpret_cast<const std::byte*>(rtpPayload.data()), rtpPayload.size());
                             });
-                    gstManager->startVideo();
+                    m_gstManager->startVideo();
+                    }
                     });
 
             // Audio Track Setup
@@ -436,25 +479,26 @@ class WebRTCManager {
             auto localAudioTrack = pc->addTrack(audioDesc);
 
             localAudioTrack->onOpen([this, localAudioTrack](){
-                    // Updated to use specific RTP frame callback for WebRTC (Opus)
-                    gstManager->setOnAudioRTPFrame([localAudioTrack](const vector<uint8_t>& rtpPayload){
+                    if(m_gstManager) {
+                    m_gstManager->setOnAudioRTPFrame([localAudioTrack](const vector<uint8_t>& rtpPayload){
                             if(localAudioTrack->isOpen())
                             localAudioTrack->send(reinterpret_cast<const std::byte*>(rtpPayload.data()), rtpPayload.size());
                             });
-                    gstManager->startAudio();
+                    m_gstManager->startAudio();
+                    }
                     });
         }
 
         void setupDataChannel(shared_ptr<PeerConnection> pc, const string &label){
             pc->onDataChannel([this](shared_ptr<DataChannel> remoteDc){
-                    lock_guard<recursive_mutex> lock(m_mutex);
+                    lock_guard<recursive_mutex> lock(m_stateMutex);
                     auto label = remoteDc->label();
-                    logWithTime("[DataChannel][Remote][" + label + "] detected");
+                    DBG(0, "[DataChannel][Remote][%s] detected\n", label.c_str());
                     if(remoteDataChannels.count(label)) return;
                     remoteDataChannels[label] = remoteDc;
 
-                    remoteDc->onOpen([label](){ logWithTime("[DataChannel][Remote][" + label + "] opened"); });
-                    remoteDc->onClosed([label](){ logWithTime("[DataChannel][Remote][" + label + "] closed"); });
+                    remoteDc->onOpen([label](){ DBG(0, "[DataChannel][Remote][%s] opened\n", label.c_str()); });
+                    remoteDc->onClosed([label](){ DBG(0, "[DataChannel][Remote][%s] closed\n", label.c_str()); });
                     remoteDc->onMessage([this, label](const variant<vector<std::byte>, string>& msg){
                             if (holds_alternative<string>(msg)) {
                             handleDataChannelText(label, get<string>(msg));
@@ -463,38 +507,35 @@ class WebRTCManager {
                     });
         }
 
-        void handleDataChannelText(const std::string& label, const std::string& text)
-        {
+        void handleDataChannelText(const std::string& label, const std::string& text) {
             json j;
             try { j = json::parse(text); } catch (...) { return; }
             if (!j.contains("eventType")) return;
-
             if (j["eventType"].get<std::string>() == "AUDIO_TRACK_ASSIGNMENT") return;
 
-            logWithTime("[Chat] [" + label + "] " + j["eventType"].get<std::string>());
+            DBG(0, "[Chat] [%s] %s\n", label.c_str(), j["eventType"].get<std::string>().c_str());
 
             if (!j.contains("senderId") || !j.contains("message")) return;
 
             string senderId = j["senderId"].get<string>();
             string msgText = j["message"].get<string>();
 
-            lock_guard<recursive_mutex> lock(m_mutex);
+            lock_guard<recursive_mutex> lock(m_stateMutex);
             if (msgText == "iamtalking") {
                 isStreamTalking[senderId] = true;
-                logWithTime("[AudioControl] Start playing audio from: " + senderId);
+                DBG(0, "[AudioControl] Start playing audio from: %s\n", senderId.c_str());
             }
             else if (msgText == "iammute") {
                 isStreamTalking[senderId] = false;
-                logWithTime("[AudioControl] Stop playing audio from: " + senderId);
+                DBG(0, "[AudioControl] Stop playing audio from: %s\n", senderId.c_str());
             }
-            // ------------------
 
-            logWithTime("[Chat] = " + j.dump());
+            DBG(0, "[Chat] = %s\n", j.dump().c_str());
         }
 
         void handleRemoteSDP(const string &streamId, const string &type, const string &sdp){
-            lock_guard<recursive_mutex> lock(m_mutex);
-            bool needDC = (streamId == roomId);
+            lock_guard<recursive_mutex> lock(m_stateMutex);
+            bool needDC = (streamId == m_roomId);
             auto pc = createPeerIfNotExist(streamId, needDC);
             if(type=="offer") prepareRecvTracksFromSDP(pc, sdp);
             Description remoteDesc(sdp, type=="offer"?Description::Type::Offer:Description::Type::Answer);
@@ -508,18 +549,102 @@ class WebRTCManager {
 
         void addRemoteCandidate(const string &streamId, const string &cand, const string &mid){
             if(cand.empty()) return;
-            lock_guard<recursive_mutex> lock(m_mutex);
+            lock_guard<recursive_mutex> lock(m_stateMutex);
             if(!pcs.count(streamId)){ pendingCandidates[streamId].emplace_back(cand, mid); return;}
             pcs[streamId]->addRemoteCandidate(Candidate(cand, mid));
         }
 
         void startOffer(const string &streamId){
-            lock_guard<recursive_mutex> lock(m_mutex);
+            lock_guard<recursive_mutex> lock(m_stateMutex);
             if(pcs.count(streamId)) pcs[streamId]->setLocalDescription(Description::Type::Offer);
         }
+
+        void cleanupResources() {
+            if (m_signaling && !m_publishStreamId.empty() && isPublisher[m_publishStreamId]){
+                try {
+                    m_signaling->sendStopPublish();
+                    m_signaling->sendStopPlayRoom();
+                    m_signaling->sendLeaveRoom();
+                } catch(...) {}
+            }
+            if (m_gstManager) m_gstManager->stopAudioPlayer();
+            m_gstManager.reset();
+
+            DBG(0, "[cleanup] closing all PeerConnections\n");
+
+            lock_guard<recursive_mutex> lock(m_stateMutex);
+            for (auto &[id, pc] : pcs) {
+                pc->onTrack(nullptr);
+                pc->onLocalCandidate(nullptr);
+                pc->onLocalDescription(nullptr);
+                pc->close();
+            }
+
+            pcs.clear();
+            localDataChannels.clear();
+            remoteDataChannels.clear();
+            remoteTracks.clear();
+            played.clear();
+            sendPlay.clear();
+            pendingCandidates.clear();
+            midTypeMap.clear();
+            isStreamTalking.clear();
+            isPublisher.clear();
+
+            m_ws.onMessage(nullptr);
+            m_ws.onOpen(nullptr);
+            m_ws.onClosed(nullptr);
+
+            if (m_signaling) { 
+                m_signaling->shutdown(); 
+                m_signaling.reset(); 
+            }
+
+            if (m_wsOpen) {
+                try { m_ws.close(); } catch(...) {}
+            }
+            m_wsOpen = false;
+        }
+
+    private:
+        // API Configurations
+        string m_signalingServerUrl;
+        string m_roomId;
+        string m_publishStreamId;
+        bool m_isOnlyPlayer;
+        atomic_bool m_wsOpen;
+        atomic_bool m_isCommunicating;
+
+        // Concurrency Controls
+        recursive_mutex m_apiMutex;   // Protects API public entry boundaries
+        recursive_mutex m_stateMutex; // Protects inner WebRTC tracking structures
+
+        // External Subsystems
+        unique_ptr<GstManager> m_gstManager;
+        shared_ptr<AMSSignalingClient> m_signaling;
+        WebSocket m_ws;
+
+        // WebRTC Object Trackers
+        unordered_map<string, shared_ptr<PeerConnection>> pcs;
+        unordered_map<string, bool> isPublisher;
+        unordered_map<string, bool> sendPlay, played;
+        unordered_map<string, vector<shared_ptr<Track>>> remoteTracks;
+        unordered_map<string, vector<Candidate>> pendingCandidates;
+        unordered_map<string, string> midTypeMap;
+        unordered_map<string, shared_ptr<DataChannel>> localDataChannels;
+        unordered_map<string, shared_ptr<DataChannel>> remoteDataChannels;
+        unordered_map<string, bool> isStreamTalking;
 };
 
-// ... consoleInputThread implementation remains same ...
+// -----------------------------------------------------------------------------
+// Simplified Non-blocking Console Input Monitor for External App Example
+// -----------------------------------------------------------------------------
+static atomic_bool g_appRunning(true);
+static void nativeSignalHandler(int sig) {
+    DBG(0, "[signal] native system exiting via signal: %d\n", sig);
+    g_appRunning = false;
+}
+
 std::thread startConsoleInputThread(std::atomic_bool& running, std::function<void(const std::string&)> onLine)
 {
     int flags = fcntl(STDIN_FILENO, F_GETFL, 0);
@@ -528,7 +653,6 @@ std::thread startConsoleInputThread(std::atomic_bool& running, std::function<voi
             char buf[512];
             std::string lineBuffer;
             struct pollfd pfd{};
-
             pfd.fd = STDIN_FILENO;
             pfd.events = POLLIN;
 
@@ -550,89 +674,49 @@ std::thread startConsoleInputThread(std::atomic_bool& running, std::function<voi
     });
 }
 
+// -----------------------------------------------------------------------------
+// Example main execution matching the requested interface behavior
+// -----------------------------------------------------------------------------
 int main(int argc, char* argv[])
 {
-    // Environment Variable Support
     const char* env_url = std::getenv("AMS_WS_URL");
-    string ams_url = (env_url != nullptr) ? string(env_url) : AMS_WS;
+    string ams_url = (env_url != nullptr) ? string(env_url) : "AMS_WEBSOCKET_URL";
 
-    // Safety check for placeholder string
     if (ams_url == "AMS_WEBSOCKET_URL") {
-        logWithTime("[ERROR] No WebSocket URL provided. Set AMS_WS_URL environment variable.");
+        DBG(0, "[ERROR] No WebSocket URL provided. Set AMS_WS_URL environment variable.\n");
         return -1;
     }
 
     bool isPlayer = (argc > 1 && string(argv[1]) == "--player");
-    string prefix = isPlayer ? "player_" : "publisher_";
-    signal(SIGINT, signalHandler);
-    signal(SIGTERM, signalHandler);
+    signal(SIGINT, nativeSignalHandler);
+    signal(SIGTERM, nativeSignalHandler);
 
-    rtc::InitLogger(rtc::LogLevel::Warning, [](rtc::LogLevel level, const std::string& msg) {
-            if (msg.find("juice: Send failed") != std::string::npos || msg.find("STUN binding failed") != std::string::npos) return;
-            std::cerr << msg << std::endl;
-            });
+    // 1. Instantiation of the newly encapsulated class
+    WebRTCManager manager;
 
-    srand((unsigned)time(nullptr));
-#if PLATFORM_NUM == 0x86
-    g_publishStreamId = "Ubuntu_" + prefix + to_string(rand());
-#else
-    g_publishStreamId = "BC04_" + prefix + to_string(rand());
-#endif
+    // 2. Set targets using requested API 1
+    manager.SetSignalingServerURL(ams_url);
 
-    logWithTime("[init] Version 1.0.4 - Starting");
-    logWithTime("[init] URL: " + ams_url);
-
-    WebRTCManager manager(ROOM_ID_STR, isPlayer);
-
-    try {
-        g_ws.open(ams_url);
-    } catch (const std::exception& e) {
-        logWithTime("[ERROR] WebSocket failed to open: " + string(e.what()));
+    // 3. Fire up core mechanisms via requested API 2
+    if (!manager.Start2WayCommunication(isPlayer)) {
+        DBG(0, "[ERROR] WebRTCManager failed initialization.\n");
         return -1;
     }
 
-    g_signaling = make_shared<AMSSignalingClient>(&g_ws, g_publishStreamId, ROOM_ID_STR);
-
-    manager.init();
-
-    g_ws.onOpen([&](){
-            logWithTime("[WS] connected");
-            g_ws_open = true;
-            manager.setupPublishPeer(g_publishStreamId);
-            g_signaling->sendJoinRoom();
+    std::thread consoleThread = startConsoleInputThread(g_appRunning, [&](const std::string& line){
+            if (line == "quit") { g_appRunning = false; return; }
+            manager.SendChatMessage(line);
             });
 
-    g_ws.onMessage([&](variant<vector<std::byte>, string> msg){
-            if (holds_alternative<string>(msg)) {
-                try { 
-                    if (g_signaling) g_signaling->handleMessage(json::parse(get<string>(msg))); 
-                } catch(...) {}
-            }
-            });
-
-    g_ws.onClosed([&](){
-            logWithTime("[WS] closed");
-            g_running = false;
-            g_ws_open = false;
-            });
-
-    std::thread consoleThread = startConsoleInputThread(g_running, [&](const std::string& line){
-            if (line == "quit") { g_running = false; return; }
-            if (g_ws_open) manager.sendChatMessage(line);
-            });
-
-    while (g_running) this_thread::sleep_for(100ms);
-    if (consoleThread.joinable()) consoleThread.join();
-
-    manager.cleanup();
-    g_ws.onMessage(nullptr);
-    g_ws.onOpen(nullptr);
-    g_ws.onClosed(nullptr);
-    if (g_signaling) { g_signaling->shutdown(); g_signaling.reset(); }
-    if (g_ws_open) {
-        try { g_ws.close(); } catch(...) {}
+    while (g_appRunning) {
+        this_thread::sleep_for(100ms);
     }
 
-    logWithTime("[main] exited");
+    if (consoleThread.joinable()) consoleThread.join();
+
+    // 4. Teardown systems explicitly using requested API 3
+    manager.Stop2WayCommunication();
+
+    DBG(0, "[main] exited\n");
     return 0;
 }
