@@ -11,3 +11,5 @@ INTERDRVVER=$(CHIPARCH)
 SHARED_LIBS += -lgstreamer-1.0 -lgobject-2.0 -lglib-2.0
 IFLAGS+=-I./include
 CFLAGS+=$(shell pkg-config --cflags gstreamer-1.0) -fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize=address -fno-sanitize=undefined -g
+DFLAGS+=-DLOG_STORAGE_LOCATION=\"/tmp\"
+DFLAGS+=-DDBG_FILE_PATH=\"log.txt\"
