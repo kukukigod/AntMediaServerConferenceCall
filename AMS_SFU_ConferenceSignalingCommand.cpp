@@ -1,4 +1,4 @@
-#include "AMSSignalingClient.h"
+#include "AMS_SFU_ConferenceSignalingCommand.h"
 #include "Logger.h"
 #include <iostream>
 
@@ -8,7 +8,7 @@ using namespace std;
 
 // ---------------- Constructor / Destructor ----------------
 
-AMSSignalingClient::AMSSignalingClient(rtc::WebSocket* ws,
+AMS_SFU_ConferenceSignalingCommand::AMS_SFU_ConferenceSignalingCommand(rtc::WebSocket* ws,
                                        const std::string& selfStreamId,
                                        const std::string& roomId)
     : ws_(ws),
@@ -17,13 +17,13 @@ AMSSignalingClient::AMSSignalingClient(rtc::WebSocket* ws,
 {
 }
 
-AMSSignalingClient::~AMSSignalingClient()
+AMS_SFU_ConferenceSignalingCommand::~AMS_SFU_ConferenceSignalingCommand()
 {
 }
 
 // ---------------- Internal helper ----------------
 
-void AMSSignalingClient::sendJson(const json& j)
+void AMS_SFU_ConferenceSignalingCommand::sendJson(const json& j)
 {
     if (!ws_) return;
 
@@ -37,7 +37,7 @@ void AMSSignalingClient::sendJson(const json& j)
 
 // ---------------- Outgoing signaling commands ----------------
 
-void AMSSignalingClient::sendPublish(bool video, bool audio)
+void AMS_SFU_ConferenceSignalingCommand::sendPublish(bool video, bool audio)
 {
     json publish = {
         {"command", "publish"},
@@ -55,7 +55,7 @@ void AMSSignalingClient::sendPublish(bool video, bool audio)
     sendJson(publish);
 }
 
-void AMSSignalingClient::sendJoinRoom()
+void AMS_SFU_ConferenceSignalingCommand::sendJoinRoom()
 {
     json join = {
         {"command", "joinRoom"},
@@ -68,7 +68,7 @@ void AMSSignalingClient::sendJoinRoom()
 }
 
 // Play whole room
-void AMSSignalingClient::sendPlayRoom()
+void AMS_SFU_ConferenceSignalingCommand::sendPlayRoom()
 {
     json play = {
         {"command", "play"},
@@ -80,7 +80,7 @@ void AMSSignalingClient::sendPlayRoom()
 }
 
 // Play specific stream
-void AMSSignalingClient::sendPlayStream(const std::string& targetStreamId)
+void AMS_SFU_ConferenceSignalingCommand::sendPlayStream(const std::string& targetStreamId)
 {
     json play = {
         {"command", "play"},
@@ -91,7 +91,7 @@ void AMSSignalingClient::sendPlayStream(const std::string& targetStreamId)
     sendJson(play);
 }
 
-void AMSSignalingClient::sendGetRoomInfo()
+void AMS_SFU_ConferenceSignalingCommand::sendGetRoomInfo()
 {
     json getRoomInfo = {
         {"command", "getRoomInfo"},
@@ -102,7 +102,7 @@ void AMSSignalingClient::sendGetRoomInfo()
     sendJson(getRoomInfo);
 }
 
-void AMSSignalingClient::sendTakeConfiguration(const std::string& streamId,
+void AMS_SFU_ConferenceSignalingCommand::sendTakeConfiguration(const std::string& streamId,
                                                const std::string& type,
                                                const std::string& sdp)
 {
@@ -116,7 +116,7 @@ void AMSSignalingClient::sendTakeConfiguration(const std::string& streamId,
     sendJson(msg);
 }
 
-void AMSSignalingClient::sendTakeCandidate(const std::string& streamId,
+void AMS_SFU_ConferenceSignalingCommand::sendTakeCandidate(const std::string& streamId,
                                            const rtc::Candidate& cand)
 {
     json candMsg = {
@@ -132,7 +132,7 @@ void AMSSignalingClient::sendTakeCandidate(const std::string& streamId,
     sendJson(candMsg);
 }
 
-void AMSSignalingClient::sendStopPublish()
+void AMS_SFU_ConferenceSignalingCommand::sendStopPublish()
 {
     json play = {
         {"command", "stop"},
@@ -142,7 +142,7 @@ void AMSSignalingClient::sendStopPublish()
     sendJson(play);
 }
 
-void AMSSignalingClient::sendStopPlayRoom()
+void AMS_SFU_ConferenceSignalingCommand::sendStopPlayRoom()
 {
     json play = {
         {"command", "stop"},
@@ -152,7 +152,7 @@ void AMSSignalingClient::sendStopPlayRoom()
     sendJson(play);
 }
 
-void AMSSignalingClient::sendLeaveRoom()
+void AMS_SFU_ConferenceSignalingCommand::sendLeaveRoom()
 {
     json leaveRoom = {
         {"command", "leaveFromRoom"},
@@ -164,7 +164,7 @@ void AMSSignalingClient::sendLeaveRoom()
 
 // ---------------- Incoming message handler ----------------
 
-void AMSSignalingClient::handleMessage(const json& msg)
+void AMS_SFU_ConferenceSignalingCommand::handleMessage(const json& msg)
 {
     if (!msg.contains("command"))
         return;
@@ -210,13 +210,13 @@ void AMSSignalingClient::handleMessage(const json& msg)
     }
 }
 
-void AMSSignalingClient::shutdown()
+void AMS_SFU_ConferenceSignalingCommand::shutdown()
 {
     onStartOfferer = nullptr;
     onRemoteSDP = nullptr;
     onRemoteCandidate = nullptr;
     onNotification = nullptr;
 
-    logWithTime("[AMSSignalingClient] shutdown complete, callbacks detached");
+    logWithTime("[AMS_SFU_ConferenceSignalingCommand] shutdown complete, callbacks detached");
 }
 

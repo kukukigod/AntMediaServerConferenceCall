@@ -3,7 +3,7 @@
 
 #include <rtc/rtc.hpp>
 #include <nlohmann/json.hpp>
-#include "AMSSignalingClient.h"
+#include "AMS_SFU_ConferenceSignalingCommand.h"
 #include <string>
 #include <functional>
 #include <memory>
@@ -62,7 +62,7 @@ private:
 
     std::string m_roomId;
     rtc::WebSocket m_ws;
-    std::shared_ptr<AMSSignalingClient> m_signaling;
+    std::shared_ptr<AMS_SFU_ConferenceSignalingCommand> m_signaling;
     bool m_wsOpen;
 };
 
