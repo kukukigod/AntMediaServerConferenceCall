@@ -183,8 +183,10 @@ void GstManager::startAudioPlayer() {
     std::lock_guard<std::mutex> lk(mutex_);
     if (audioPlayerPipeline_) return;
 
+    // MODIFIED: Removed 'do-timestamp=true' because incoming data packets are raw WebRTC RTP stream.
+    // Overwriting timestamps at appsrc causes severe synchronization mismatch inside rtpjitterbuffer.
     std::string audioPlayDesc =
-        "appsrc name=audio_src is-live=true do-timestamp=true format=time ! "
+        "appsrc name=audio_src is-live=true format=time ! "
         "application/x-rtp,media=audio,clock-rate=48000,encoding-name=OPUS,payload=111 ! "
         "rtpjitterbuffer latency=200 ! rtpopusdepay ! opusdec ! audioconvert ! audioresample ! autoaudiosink";
 
@@ -217,15 +219,22 @@ void GstManager::pushAudioFrame(const uint8_t* data, size_t size) {
     if (!audioAppSrc_) return;
 
     GstBuffer* buffer = gst_buffer_new_allocate(nullptr, size, nullptr);
+    if (!buffer) return;
+
     gst_buffer_fill(buffer, 0, data, size);
     
-    // Debug print for PTS/DTS
-    GST_BUFFER_PTS(buffer) = gst_util_get_timestamp();
-    GST_BUFFER_DTS(buffer) = GST_BUFFER_PTS(buffer);
+    // MODIFIED: Crucial fix for WebRTC audio issues. 
+    // Stripping manual system timestamp assignments. By assigning GST_CLOCK_TIME_NONE,
+    // we instruct GStreamer to fully respect the internal RTP timestamp header instead of triggering drops in rtpjitterbuffer.
+    GST_BUFFER_PTS(buffer) = GST_CLOCK_TIME_NONE;
+    GST_BUFFER_DTS(buffer) = GST_CLOCK_TIME_NONE;
 
     GstFlowReturn ret;
+    // Note: g_signal_emit_by_name automatically transfers buffer ownership into the appsrc component.
     g_signal_emit_by_name(audioAppSrc_, "push-buffer", buffer, &ret);
-    gst_buffer_unref(buffer);
+    
+    // MODIFIED: Critically removed 'gst_buffer_unref(buffer)' call. 
+    // Doing so prevents double-free undefined behaviors since the underlying pipeline handles lifecycle cleanups.
 }
 
 // ---------------- Callbacks ----------------

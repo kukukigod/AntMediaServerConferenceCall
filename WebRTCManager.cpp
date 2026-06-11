@@ -2,7 +2,7 @@
 #include <nlohmann/json.hpp>
 #include "sdptransform.hpp"
 #include "GstManager.h"
-#include "AMSSignalingClient.h"
+#include "AMS_SFU_ConferenceSignaling.h"
 #include "Logger.h"
 #include "Log.h"
 
@@ -29,16 +29,6 @@ using namespace std;
 
 #define ROOM_ID_STR   "room1"
 
-enum class AMSEvent {
-    UNKNOWN,
-    JOINED_THE_ROOM,
-    PUBLISH_STARTED,
-    PLAY_STARTED,
-    PLAY_FINISHED,
-    SUBTRACK_ADDED,
-    SUBTRACK_REMOVED
-};
-
 class WebRTCManager {
     public:
         WebRTCManager() 
@@ -46,7 +36,6 @@ class WebRTCManager {
             m_roomId(ROOM_ID_STR), 
             m_publishStreamId(""),
             m_isOnlyPlayer(false), 
-            m_wsOpen(false), 
             m_isCommunicating(false) 
     {
         // Initialize libdatachannel logger
@@ -82,7 +71,6 @@ class WebRTCManager {
 
             m_isOnlyPlayer = isPlayer;
             m_isCommunicating = true;
-            m_wsOpen = false;
 
             string prefix = m_isOnlyPlayer ? "player_" : "publisher_";
             srand((unsigned)time(nullptr));
@@ -99,39 +87,14 @@ class WebRTCManager {
             m_gstManager = make_unique<GstManager>(720, 480, 30, 1000000);
             m_gstManager->startAudioPlayer();
 
-            // Setup Signaling client wrapper
-            m_signaling = make_shared<AMSSignalingClient>(&m_ws, m_publishStreamId, m_roomId);
+            // Setup abstracted context component
+            m_signalingContext = make_unique<AMS_SFU_ConferenceSignaling>(m_roomId);
 
-            // Setup signaling and WebRTC state machine
+            // Establish decoupled modern state machine bindings using functional lambdas
             initWebRTCStateMachine();
 
-            // Setup WebSocket Callbacks before opening
-            m_ws.onOpen([this](){
-                    DBG(0, "[WS] connected\n");
-                    m_wsOpen = true;
-                    setupPublishPeer(m_publishStreamId);
-                    if (m_signaling) {
-                    m_signaling->sendJoinRoom();
-                    }
-                    });
-
-            m_ws.onMessage([this](variant<vector<std::byte>, string> msg){
-                    if (holds_alternative<string>(msg)) {
-                    try { 
-                    if (m_signaling) m_signaling->handleMessage(json::parse(get<string>(msg))); 
-                    } catch(...) {}
-                    }
-                    });
-
-            m_ws.onClosed([this](){
-                    DBG(0, "[WS] closed\n");
-                    m_wsOpen = false;
-                    });
-
-            try {
-                m_ws.open(m_signalingServerUrl);
-            } catch (const std::exception& e) {
-                DBG(0, "[ERROR] WebSocket failed to open: %s\n", e.what());
+            if (!m_signalingContext->Connect(m_signalingServerUrl, m_publishStreamId)) {
+                DBG(0, "[ERROR] WebSocket failed to open via decoupled handler\n");
                 cleanupResources();
                 m_isCommunicating = false;
                 return false;
@@ -154,7 +117,7 @@ class WebRTCManager {
         // Exposed Chat Tool API for main usage
         void SendChatMessage(const string& text) {
             lock_guard<recursive_mutex> lock(m_apiMutex);
-            if (!m_isCommunicating || !m_wsOpen) {
+            if (!m_isCommunicating || !m_signalingContext || !m_signalingContext->IsOpen()) {
                 DBG(0, "[API] Cannot send chat message. Not connected.\n");
                 return;
             }
@@ -194,112 +157,94 @@ class WebRTCManager {
         }
 
     private:
-        AMSEvent stringToEvent(const std::string& def) {
-            static const std::unordered_map<std::string, AMSEvent> eventMap = {
-                {"joinedTheRoom",   AMSEvent::JOINED_THE_ROOM},
-                {"publish_started", AMSEvent::PUBLISH_STARTED},
-                {"play_started",    AMSEvent::PLAY_STARTED},
-                {"play_finished",   AMSEvent::PLAY_FINISHED},
-                {"subtrackAdded",   AMSEvent::SUBTRACK_ADDED},
-                {"subtrackRemoved", AMSEvent::SUBTRACK_REMOVED}
-            };
-            auto it = eventMap.find(def);
-            return (it != eventMap.end()) ? it->second : AMSEvent::UNKNOWN;
-        }
-
         void initWebRTCStateMachine() {
-            // Both roles setup the "Self" PeerConnection for DataChannel/Signaling
+            // Setup self connection parameters explicitly aligned to initialization
             setupPublishPeer(m_publishStreamId);
 
-            m_signaling->onStartOfferer = [this](const string& streamId){
+            m_signalingContext->onConnected = [this]() {
+                DBG(0, "[WS] connected\n");
+                setupPublishPeer(m_publishStreamId);
+                m_signalingContext->SendJoinRoom();
+            };
+
+            m_signalingContext->onDisconnected = [this]() {
+                DBG(0, "[WS] closed\n");
+            };
+
+            m_signalingContext->onStartOfferer = [this](const string& streamId){
                 DBG(0, "[info] Got 'start', I am offerer for stream %s\n", streamId.c_str());
                 startOffer(streamId);
             };
 
-            m_signaling->onRemoteSDP = [this](const string& streamId, const string& type, const string& sdp){
+            m_signalingContext->onRemoteSDP = [this](const string& streamId, const string& type, const string& sdp){
                 handleRemoteSDP(streamId, type, sdp);
             };
 
-            m_signaling->onRemoteCandidate = [this](const string& streamId, const string& cand, const string& mid, int label){
+            m_signalingContext->onRemoteCandidate = [this](const string& streamId, const string& cand, const string& mid){
                 addRemoteCandidate(streamId, cand, mid);
             };
 
-            m_signaling->onNotification = [this](const nlohmann::json& msg) {
-                std::string def = msg.value("definition", "");
-                AMSEvent event = stringToEvent(def);
+            // Mapping clean atomic logic bindings from external event loop notifications
+            m_signalingContext->onJoinedRoomNotification = [this](bool triggeredByAms) {
+                if (m_isOnlyPlayer) {
+                    DBG(0, "[Role] Player: Publishing with NO media (DataChannel only)\n");
+                    m_signalingContext->SendPublish(false, false);
+                } else {
+                    DBG(0, "[Role] Publisher: Publishing WITH media\n");
+                    m_signalingContext->SendPublish(true, true);
+                }
+            };
 
-                std::string streamId = msg.contains("streamId") ? msg["streamId"].get<std::string>() : "";
-                std::string trackId  = msg.contains("trackId")  ? msg["trackId"].get<std::string>()  : "";
+            m_signalingContext->onPublishStartedNotification = [this]() {
+                if (sendPlay.find(m_roomId) == sendPlay.end()) {
+                    sendPlay[m_roomId] = true;
+                    m_signalingContext->SendPlayRoom();
+                }
+            };
 
-                switch (event) {
-                    case AMSEvent::JOINED_THE_ROOM:
-                        if (m_isOnlyPlayer) {
-                            DBG(0, "[Role] Player: Publishing with NO media (DataChannel only)\n");
-                            m_signaling->sendPublish(false, false);
-                        } else {
-                            DBG(0, "[Role] Publisher: Publishing WITH media\n");
-                            m_signaling->sendPublish(true, true);
+            m_signalingContext->onPlayStartedNotification = [this](const string& streamId) {
+                if (!streamId.empty()) {
+                    played[streamId] = true;
+                }
+            };
+
+            m_signalingContext->onPlayFinishedNotification = [this](const string& streamId) {
+                if (!streamId.empty()) {
+                    removePeerIfNotExist(streamId);
+                    if (streamId == m_roomId) {
+                        sendPlay[m_roomId] = true;
+                        m_signalingContext->SendPlayRoom();
+                        DBG(0, "[room] Only one peer in the room, send play room again\n");
+                    }
+                }
+            };
+
+            m_signalingContext->onSubtrackAddedNotification = [this](const string& trackId) {
+                if (!trackId.empty() && trackId != m_publishStreamId) {
+                    lock_guard<recursive_mutex> lock(m_stateMutex);
+
+                    if (pcs.count(trackId)) {
+                        if (pcs[trackId]->state() != rtc::PeerConnection::State::Closed) {
+                            return;
                         }
-                        break;
+                    }
 
-                    case AMSEvent::PUBLISH_STARTED:
-                        if (sendPlay.find(m_roomId) == sendPlay.end()) {
-                            sendPlay[m_roomId] = true;
-                            m_signaling->sendPlayRoom();
-                        }
-                        break;
+                    if (sendPlay.count(trackId) && sendPlay[trackId]) return;
 
-                    case AMSEvent::PLAY_STARTED:
-                        if (!streamId.empty()) {
-                            played[streamId] = true;
-                        }
-                        break;
+                    sendPlay[trackId] = true;
+                    DBG(0, "[room] New remote track detected: %s, sending play\n", trackId.c_str());
+                    m_signalingContext->SendPlayStream(trackId);
+                }
+            };
 
-                    case AMSEvent::PLAY_FINISHED:
-                        if (!streamId.empty()) {
-                            removePeerIfNotExist(streamId);
-                            if (streamId == m_roomId) {
-                                sendPlay[m_roomId] = true;
-                                m_signaling->sendPlayRoom();
-                                DBG(0, "[room] Only one peer in the room, send play room again\n");
-                            }
-                        }
-                        break;
-
-                    case AMSEvent::SUBTRACK_ADDED:
-                        if (!trackId.empty() && trackId != m_publishStreamId) {
-                            lock_guard<recursive_mutex> lock(m_stateMutex);
-
-                            if (pcs.count(trackId)) {
-                                if (pcs[trackId]->state() != rtc::PeerConnection::State::Closed) {
-                                    return;
-                                }
-                            }
-
-                            if (sendPlay.count(trackId) && sendPlay[trackId]) return;
-
-                            sendPlay[trackId] = true;
-                            DBG(0, "[room] New remote track detected: %s, sending play\n", trackId.c_str());
-                            m_signaling->sendPlayStream(trackId);
-                        }
-                        break;
-
-                    case AMSEvent::SUBTRACK_REMOVED:
-                        if (!trackId.empty()) {
-                            if (sendPlay.count(trackId)) {
-                                sendPlay.erase(trackId);
-                                DBG(0, "[room] Remote track leaved, trackId %s\n", trackId.c_str());
-                            } else {
-                                DBG(0, "[room] Remote track leaved, ignore trackId %s\n", trackId.c_str());
-                            }
-                        }
-                        break;
-
-                    default:
-                        if (!def.empty()) {
-                            DBG(0, "[warning] Unknown AMS event definition: %s\n", def.c_str());
-                        }
-                        break;
+            m_signalingContext->onSubtrackRemovedNotification = [this](const string& trackId) {
+                if (!trackId.empty()) {
+                    if (sendPlay.count(trackId)) {
+                        sendPlay.erase(trackId);
+                        DBG(0, "[room] Remote track leaved, trackId %s\n", trackId.c_str());
+                    } else {
+                        DBG(0, "[room] Remote track leaved, ignore trackId %s\n", trackId.c_str());
+                    }
                 }
             };
         }
@@ -356,10 +301,10 @@ class WebRTCManager {
             if(needDC) setupDataChannel(pc, streamId);
 
             pc->onTrack([this, streamId](shared_ptr<Track> track){ addRemoteTrack(track, streamId); });
-            pc->onLocalCandidate([this, streamId](Candidate c){ if (m_signaling) m_signaling->sendTakeCandidate(streamId, c); });
+            pc->onLocalCandidate([this, streamId](Candidate c){ if (m_signalingContext) m_signalingContext->SendTakeCandidate(streamId, c); });
             pc->onLocalDescription([this, streamId](Description desc){
-                    if (m_signaling) {
-                    m_signaling->sendTakeConfiguration(
+                    if (m_signalingContext) {
+                    m_signalingContext->SendTakeConfiguration(
                             streamId,
                             desc.type() == Description::Type::Offer ? "offer" : "answer",
                             string(desc)
@@ -404,7 +349,7 @@ class WebRTCManager {
             track->onMessage([this, kind, streamId](std::variant<std::vector<std::byte>, std::string> msg){
                     if (kind == "audio" && holds_alternative<std::vector<std::byte>>(msg)){
                     auto &data = get<std::vector<std::byte>>(msg);
-
+                    DBG(1, "Get audio data, len = %ld\n", data.size());
                     bool playStream = false;
                     lock_guard<recursive_mutex> lock(m_stateMutex);
                     if(isStreamTalking.count(streamId))
@@ -560,11 +505,11 @@ class WebRTCManager {
         }
 
         void cleanupResources() {
-            if (m_signaling && !m_publishStreamId.empty() && isPublisher[m_publishStreamId]){
+            if (m_signalingContext && !m_publishStreamId.empty() && isPublisher[m_publishStreamId]){
                 try {
-                    m_signaling->sendStopPublish();
-                    m_signaling->sendStopPlayRoom();
-                    m_signaling->sendLeaveRoom();
+                    m_signalingContext->SendStopPublish();
+                    m_signalingContext->SendStopPlayRoom();
+                    m_signalingContext->SendLeaveRoom();
                 } catch(...) {}
             }
             if (m_gstManager) m_gstManager->stopAudioPlayer();
@@ -591,19 +536,11 @@ class WebRTCManager {
             isStreamTalking.clear();
             isPublisher.clear();
 
-            m_ws.onMessage(nullptr);
-            m_ws.onOpen(nullptr);
-            m_ws.onClosed(nullptr);
-
-            if (m_signaling) { 
-                m_signaling->shutdown(); 
-                m_signaling.reset(); 
+            if (m_signalingContext) { 
+                m_signalingContext->Disconnect();
+                m_signalingContext->ShutdownClient(); 
+                m_signalingContext.reset(); 
             }
-
-            if (m_wsOpen) {
-                try { m_ws.close(); } catch(...) {}
-            }
-            m_wsOpen = false;
         }
 
     private:
@@ -612,7 +549,6 @@ class WebRTCManager {
         string m_roomId;
         string m_publishStreamId;
         bool m_isOnlyPlayer;
-        atomic_bool m_wsOpen;
         atomic_bool m_isCommunicating;
 
         // Concurrency Controls
@@ -620,9 +556,9 @@ class WebRTCManager {
         recursive_mutex m_stateMutex; // Protects inner WebRTC tracking structures
 
         // External Subsystems
+        uint32_t placeholder_val;
         unique_ptr<GstManager> m_gstManager;
-        shared_ptr<AMSSignalingClient> m_signaling;
-        WebSocket m_ws;
+        unique_ptr<AMS_SFU_ConferenceSignaling> m_signalingContext;
 
         // WebRTC Object Trackers
         unordered_map<string, shared_ptr<PeerConnection>> pcs;
