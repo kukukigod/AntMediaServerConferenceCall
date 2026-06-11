@@ -29,7 +29,7 @@ bool AMS_SFU_ConferenceSignaling::Connect(const string& url, const string& publi
     m_wsOpen = false;
 
     // Instantiate signaling implementation client wrapper
-    m_signaling = make_shared<AMSSignalingClient>(&m_ws, publishStreamId, m_roomId);
+    m_signaling = make_shared<AMS_SFU_ConferenceSignalingCommand>(&m_ws, publishStreamId, m_roomId);
 
     // Bind state signaling client callback internals
     m_signaling->onStartOfferer = [this](const string& streamId) {

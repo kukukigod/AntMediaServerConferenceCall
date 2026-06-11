@@ -5,13 +5,13 @@
 #include <functional>
 #include <string>
 
-class AMSSignalingClient {
+class AMS_SFU_ConferenceSignalingCommand {
 public:
-    AMSSignalingClient(rtc::WebSocket* ws,
+    AMS_SFU_ConferenceSignalingCommand(rtc::WebSocket* ws,
                        const std::string& selfStreamId,
                        const std::string& roomId);
 
-    ~AMSSignalingClient();
+    ~AMS_SFU_ConferenceSignalingCommand();
 
     // ---- Outgoing commands ----
     void sendPublish(bool video, bool audio);
@@ -44,8 +44,8 @@ public:
 	void shutdown(); 
 
 private:
-    AMSSignalingClient(const AMSSignalingClient&) = delete;
-    AMSSignalingClient& operator=(const AMSSignalingClient&) = delete;
+    AMS_SFU_ConferenceSignalingCommand(const AMS_SFU_ConferenceSignalingCommand&) = delete;
+    AMS_SFU_ConferenceSignalingCommand& operator=(const AMS_SFU_ConferenceSignalingCommand&) = delete;
 
 private:
     rtc::WebSocket* ws_;
