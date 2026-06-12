@@ -19,7 +19,11 @@ int DBGHandleOldLog(const char *path , const char *filename);
 #include <stdlib.h>
 
 #define __FILENAME__ (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
-#define DBG(x, y...) {\
+
+/* ========================================================================= */
+/* MODIFIED SECTION: Safe do-while(0) infrastructure wrappers for DBG macros */
+/* ========================================================================= */
+#define DBG(x, y...) do {\
     if(GetDebugLevel() >= x)\
     {\
         size_t payloadSize = 1 + snprintf(NULL, 0, "[%s:%d %s()]: ", __FILENAME__, __LINE__, __FUNCTION__); \
@@ -35,9 +39,9 @@ int DBGHandleOldLog(const char *path , const char *filename);
             free(dbgStr); \
         } \
     }\
-}
+} while(0) /* FIXED: Replaced trailing brace with safe do-while structure */
 
-#define DBG_DATA(x, y...) {\
+#define DBG_DATA(x, y...) do {\
     if(GetDebugLevel() >= x)\
     {\
         size_t nmeaSize = 1 + snprintf(NULL, 0, y); \
@@ -50,7 +54,8 @@ int DBGHandleOldLog(const char *path , const char *filename);
             free(nmeaStr); \
         } \
     }\
-}
+} while(0) /* FIXED: Replaced trailing brace with safe do-while structure */
+/* ========================================================================= */
 
 #ifdef __cplusplus
 }
