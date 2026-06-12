@@ -1,5 +1,5 @@
 #include "AMS_SFU_ConferenceSignalingCommand.h"
-#include "Logger.h"
+#include "Log.h"
 #include <iostream>
 
 using namespace rtc;
@@ -29,10 +29,11 @@ void AMS_SFU_ConferenceSignalingCommand::sendJson(const json& j)
 
     std::string msg = j.dump();
     ws_->send(msg);
-	if(j["command"] == "takeConfiguration")
-		logWithTime("[Peer => AMS] takeConfiguration");
-	else
-		logWithTime("[Peer => AMS] " + msg);
+	if(j["command"] == "takeConfiguration"){
+		DBG(0, "[Peer => AMS] takeConfiguration\n");
+    }else{
+		DBG(0, "[Peer => AMS] %s\n", msg.c_str());
+    }
 }
 
 // ---------------- Outgoing signaling commands ----------------
@@ -177,14 +178,15 @@ void AMS_SFU_ConferenceSignalingCommand::handleMessage(const json& msg)
 			return;
 		}
 	}
-		
+
 	if (msg.contains("streamId"))
 		streamId = msg.value("streamId", "");
-	if (command == "takeConfiguration" || command == "takeCandidate")
-		logWithTime("[AMS => Peer] command = " + command + ", streamId = " + streamId);
-	else
-		logWithTime("[AMS => Peer] " + msg.dump());
-	
+	if (command == "takeConfiguration" || command == "takeCandidate"){
+		DBG(0, "[AMS => Peer] command = %s, streamId = %s\n", command.c_str(), streamId.c_str());
+    }else{
+		DBG(0, "[AMS => Peer] %s\n", msg.dump().c_str());
+    }
+
     if (command == "start") {
         if (onStartOfferer)
             onStartOfferer(streamId);
@@ -217,6 +219,6 @@ void AMS_SFU_ConferenceSignalingCommand::shutdown()
     onRemoteCandidate = nullptr;
     onNotification = nullptr;
 
-    logWithTime("[AMS_SFU_ConferenceSignalingCommand] shutdown complete, callbacks detached");
+    DBG(0, "[AMS_SFU_ConferenceSignalingCommand] shutdown complete, callbacks detached");
 }
 

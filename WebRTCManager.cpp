@@ -3,7 +3,6 @@
 #include "sdptransform.hpp"
 #include "GstManager.h"
 #include "AMS_SFU_ConferenceSignaling.h"
-#include "Logger.h"
 #include "Log.h"
 
 #include <iostream>

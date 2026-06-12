@@ -1,10 +1,10 @@
 #include "GstManager.h"
+#include "Log.h"
 #include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
 #include <iostream>
 #include <chrono> 
 #include <ctime>
-#include "Logger.h"
 
 GstManager::GstManager(int width, int height, int fps, int videoBitrate,
                         uint32_t videoSSRC, uint32_t audioSSRC)
@@ -84,7 +84,7 @@ void GstManager::startVideo() {
 #endif
 
     GError* error = nullptr;
-    logWithTime("Video Pipeline = " + videoPipelineDesc);
+    DBG(0, "Video Pipeline = %s\n", videoPipelineDesc.c_str());
     videoPipeline_ = gst_parse_launch(videoPipelineDesc.c_str(), &error);
     if (!videoPipeline_ || error) {
         std::cerr << "[GstManager] Failed to create video pipeline: " << (error ? error->message : "Unknown") << std::endl;
@@ -159,7 +159,7 @@ void GstManager::startAudio() {
 
     GError* error = nullptr;
     audioPipeline_ = gst_parse_launch(audioPipelineDesc.c_str(), &error);
-    logWithTime("Audio Pipeline = " + audioPipelineDesc);
+    DBG(0, "Audio Pipeline = %s\n", audioPipelineDesc.c_str());
     if (!audioPipeline_ || error) {
         std::cerr << "[GstManager] Failed to create audio pipeline: " << (error ? error->message : "Unknown") << std::endl;
         if (error) g_error_free(error);
